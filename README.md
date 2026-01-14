@@ -179,4 +179,4 @@ If you want interop with C, treat it as a spec candidate and pin a versioned for
 
 ## License
 
-No license is currently included. If you plan to publish/distribute, add a LICENSE file (MIT/BSD/Apache, etc.).
+MIT
