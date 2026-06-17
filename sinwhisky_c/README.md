@@ -107,8 +107,18 @@ typedef struct sw_params {
     double aperture_gain;   /* scale factor applied to max |dy| */
     double aperture_min;    /* clamp min (recommended 1.0) */
     double aperture_max;    /* clamp max (recommended ~8..16) */
+
+    int    neighbors;       /* circles per side that may influence a sample */
 } sw_params_t;
 ```
+
+- `neighbors = 1` (default) is the classic SinWhisky behaviour: each in-between
+  sample is the sine-weighted blend of the two circles that surely pass through
+  it (the one centred at `i` and the one centred at `i+1`).
+- `neighbors >= 2` lets circles extend **beyond the three circumscribed points**
+  (whitepaper, p.7), blending circles centred further away. A circle drops out
+  automatically once the evaluation point leaves its horizontal extent, so larger
+  values degrade gracefully instead of producing NaNs.
 
 **Recommended starting point:**
 
@@ -159,15 +169,16 @@ We pick the branch that passes through the middle sample `y[i]`.
 
 ### Blending with sine weights
 
-Between samples `i` and `i+1`, each intermediate position `t` (0..1) can be predicted from:
-
-- the circle centered at `i` (evaluated at `u = +t`, local right half)
-- the circle centered at `i+1` (evaluated at `u = t-1`, local left half)
+For an output position `g = i + t` (`t` in `0..1`), every interior circle whose
+center `j` is within `neighbors` of `g` is evaluated at its own local offset
+`u = g - j` (so `x_local = u * aperture_j`).
 
 Each prediction gets a window weight:
 
-- `w = sin(pi * (u+1)/2)` for `u in [-1, 1]`
-- peaks at the circle center (`u = 0`)
+- `w(u) = cos(pi * u / (2 * neighbors))` for `|u| < neighbors`, else `0`
+- peaks at the circle center (`u = 0`) and vanishes at the support edge
+- for `neighbors = 1` this is `cos(pi*u/2) == sin(pi*(u+1)/2)`, i.e. the classic
+  sine weighting, and only circles `i` and `i+1` contribute
 
 The output is the weighted average of valid predictions.
 If no valid prediction exists, we fall back to **linear interpolation**.
@@ -201,22 +212,33 @@ If no valid prediction exists, we fall back to **linear interpolation**.
 
 ---
 
-## Testing tips
+## Testing
 
-- Compare output against the Python reference by resampling the same `in[]` and diffing the generated CSV.
-- Plot `out.csv` to visually inspect continuity and overshoot behavior.
-- Stress test with:
-  - constant signals
-  - ramps / steps
-  - alternating spikes
-  - random noise
+A `stdin` CLI (`sw_cli.c`) is provided so the C core can be diffed against the
+Python reference (`v2/whisky.py::sinwhisky_resample`):
+
+```bash
+gcc -std=c99 -O2 sinwhisky.c sw_cli.c -lm -o sw_cli
+# sw_cli <zoom> [neighbors] [use_aperture]
+echo "0 1 0 -1 0" | ./sw_cli 3 1 1
+```
+
+The repository's test suite compiles this CLI automatically and asserts the C
+and Python outputs agree across many signals / zoom / neighbors / aperture
+combinations:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Other useful stress inputs: constant signals, ramps / steps, alternating
+spikes, and random noise.
 
 ---
 
 ## License
 
-No explicit license is included here. If you plan to publish/distribute this repository, add a license file
-(e.g. MIT/BSD-2/Apache-2.0) according to your needs.
+MIT (see the `LICENSE` file at the repository root).
 
 ---
 

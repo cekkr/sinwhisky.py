@@ -172,3 +172,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .DS_Store
+
+# Compiled C demo / CLI binaries
+sinwhisky_c/sinwhisky_demo
+sinwhisky_c/sw_cli
+*.o
+*.out

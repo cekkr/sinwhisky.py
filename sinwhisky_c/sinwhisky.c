@@ -1,4 +1,3 @@
-\
 #include "sinwhisky.h"
 #include <stdlib.h>
 #include <math.h>
@@ -19,13 +18,21 @@ static double sw_max3(double a, double b, double c) {
     return (m > c) ? m : c;
 }
 
-/* sine window on [-1, +1] -> [0, 1], peak at 0 */
-static double sw_sine_weight(double u) {
-    /* u in [-1,1], p in [0,1] */
-    double p = (u + 1.0) * 0.5;
-    if (p <= 0.0) return 0.0;
-    if (p >= 1.0) return 0.0;
-    return sin(SW_PI * p);
+/*
+  Window that "favours the central values of a circle at the expense of the
+  extreme ones" (paper, page 8). For a circle centre offset u (in original
+  sample units) and a support of N segments per side:
+
+      w(u) = cos( pi * u / (2*N) )   for |u| <= N, else 0.
+
+  It peaks at u = 0 (the circle's own centre) and vanishes at |u| = N.
+  For N == 1 this is cos(pi*u/2) == sin(pi*(u+1)/2), i.e. the classic SinWhisky
+  sine weighting.
+*/
+static double sw_sine_weight(double u, int neighbors) {
+    const double N = (neighbors >= 1) ? (double)neighbors : 1.0;
+    if (u <= -N || u >= N) return 0.0;
+    return cos(SW_PI * u / (2.0 * N));
 }
 
 /* ---------- circle core ---------- */
@@ -58,7 +65,7 @@ static int sw_circle_from_three_points(double x1, double y1,
     const double b1 = (x3*x3 - x2*x2) + (y3*y3 - y2*y2);
 
     const double det = A00 * A11 - A01 * A10;
-    if (fabs(det) < eps) {
+    if (!isfinite(det) || fabs(det) < eps) {
         return 0; /* nearly collinear / unstable */
     }
 
@@ -68,14 +75,16 @@ static int sw_circle_from_three_points(double x1, double y1,
     const double dy = cy - y2;
     const double r  = sqrt(dx*dx + dy*dy);
 
-    if (!isfinite(r) || r <= 0.0) {
+    if (!isfinite(cx) || !isfinite(cy) || !isfinite(r) || r <= 0.0) {
         return 0;
     }
 
     out->cx = cx;
     out->cy = cy;
     out->r  = r;
-    /* arc side: choose the branch that hits y2 at x2 */
+    /* arc side: choose the branch that hits y2 at x2 (x2 == 0 locally).
+       The branch is single-valued and continuous over the whole horizontal
+       extent (cx-r, cx+r), so it stays correct even when extrapolated. */
     out->upper = (y2 >= cy) ? 1 : 0;
     out->valid = 1;
     return 1;
@@ -86,7 +95,7 @@ static int sw_circle_eval(const sw_circle_t* c, double x_local, double* y_out)
     /* circle: (x - cx)^2 + (y - cy)^2 = r^2 */
     const double dx = x_local - c->cx;
     const double inside = c->r * c->r - dx * dx;
-    if (inside < 0.0) return 0;
+    if (inside < 0.0) return 0; /* outside the circle's horizontal extent */
     const double dy = sqrt(inside);
     *y_out = c->upper ? (c->cy + dy) : (c->cy - dy);
     return isfinite(*y_out) ? 1 : 0;
@@ -99,12 +108,15 @@ static sw_circle_t sw_build_circle(const float* y, size_t n, size_t i,
     sw_circle_t c;
     memset(&c, 0, sizeof(c));
     c.valid = 0;
+    c.aperture = 1.0;
 
     if (i == 0 || i + 1 >= n) return c;
 
     const double y0 = (double)y[i - 1];
     const double y1 = (double)y[i];
     const double y2 = (double)y[i + 1];
+
+    if (!isfinite(y0) || !isfinite(y1) || !isfinite(y2)) return c;
 
     double aperture = 1.0;
     if (p->use_aperture) {
@@ -128,8 +140,10 @@ static sw_circle_t sw_build_circle(const float* y, size_t n, size_t i,
 
     if (!sw_circle_from_three_points(x0, y0, x1, y1, x2, y2, p->collinear_eps, &c)) {
         c.valid = 0;
+        c.aperture = aperture; /* keep for diagnostics; valid stays 0 */
         return c;
     }
+    c.aperture = aperture;
     return c;
 }
 
@@ -145,6 +159,7 @@ sw_params_t sw_default_params(int zoom)
     p.aperture_gain = 1.0;
     p.aperture_min  = 1.0;
     p.aperture_max  = 12.0;
+    p.neighbors     = 1; /* classic two-circle blend */
     return p;
 }
 
@@ -158,6 +173,7 @@ float* sw_resample_alloc(const float* in_samples, size_t n_in,
 
     sw_params_t p = params ? *params : sw_default_params(0);
     if (p.zoom < 0) p.zoom = 0;
+    if (p.neighbors < 1) p.neighbors = 1;
 
     if (n_in == 1) {
         float* out = (float*)malloc(sizeof(float));
@@ -177,11 +193,15 @@ float* sw_resample_alloc(const float* in_samples, size_t n_in,
     sw_circle_t* circles = (sw_circle_t*)malloc(n_in * sizeof(sw_circle_t));
     if (!circles) { free(out); return NULL; }
     for (size_t i = 0; i < n_in; ++i) {
+        memset(&circles[i], 0, sizeof(circles[i]));
         circles[i].valid = 0;
     }
     for (size_t i = 1; i + 1 < n_in; ++i) {
         circles[i] = sw_build_circle(in_samples, n_in, i, &p);
     }
+
+    const int    N    = p.neighbors;
+    const double dN    = (double)N;
 
     size_t w = 0;
     for (size_t i = 0; i + 1 < n_in; ++i) {
@@ -191,32 +211,34 @@ float* sw_resample_alloc(const float* in_samples, size_t n_in,
         /* insert zoom samples between i and i+1 */
         for (size_t k = 1; k <= zoom; ++k) {
             const double t = (double)k / (double)(zoom + 1); /* in (0,1) */
+            const double g = (double)i + t;                  /* global position */
 
             double sum_w = 0.0;
             double sum_y = 0.0;
 
-            /* left circle centered at i (needs i in [1..n-2]) */
-            if (i >= 1 && i + 1 < n_in && circles[i].valid) {
-                const double u = +t; /* local u in [0,1] */
-                const double x_local = u * circles[i].aperture;
-                double y_pred;
-                if (sw_circle_eval(&circles[i], x_local, &y_pred)) {
-                    const double ww = sw_sine_weight(u);
-                    sum_w += ww;
-                    sum_y += ww * y_pred;
-                }
-            }
+            /* Blend every interior circle whose centre is within N of g.
+               j ranges over valid centres [1 .. n_in-2]. */
+            long jlo = (long)i - (N - 1);
+            long jhi = (long)i + N;
+            if (jlo < 1) jlo = 1;
+            if (jhi > (long)n_in - 2) jhi = (long)n_in - 2;
 
-            /* right circle centered at i+1 */
-            if (i + 1 >= 1 && i + 2 < n_in && circles[i+1].valid) {
-                const double u = t - 1.0; /* local u in [-1,0] */
-                const double x_local = u * circles[i+1].aperture;
+            for (long j = jlo; j <= jhi; ++j) {
+                const sw_circle_t* c = &circles[j];
+                if (!c->valid) continue;
+
+                const double u = g - (double)j; /* offset in sample units */
+                if (u <= -dN || u >= dN) continue;
+
+                const double x_local = u * c->aperture;
                 double y_pred;
-                if (sw_circle_eval(&circles[i+1], x_local, &y_pred)) {
-                    const double ww = sw_sine_weight(u);
-                    sum_w += ww;
-                    sum_y += ww * y_pred;
-                }
+                if (!sw_circle_eval(c, x_local, &y_pred)) continue;
+
+                const double ww = sw_sine_weight(u, N);
+                if (ww <= 0.0) continue;
+
+                sum_w += ww;
+                sum_y += ww * y_pred;
             }
 
             double y_out;

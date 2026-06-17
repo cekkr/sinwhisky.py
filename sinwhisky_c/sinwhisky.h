@@ -30,6 +30,21 @@ typedef struct sw_params {
     double aperture_gain;   /* multiply max |dy| by this */
     double aperture_min;    /* clamp min (recommended 1.0) */
     double aperture_max;    /* clamp max (recommended ~8..16) */
+    /*
+      How many neighbouring circles (on each side) may influence one output
+      sample. The paper (page 7) notes the circles "can go beyond the three
+      circumscribed points", giving more precision than blending only the two
+      circles that surely pass through the predicted point.
+
+      neighbors == 1  -> classic behaviour: blend the circle centred at i
+                         (right half) and the one centred at i+1 (left half).
+      neighbors == 2  -> also blend circles centred at i-1 and i+2,
+                         extrapolated along their own arc, etc.
+
+      A circle stops contributing as soon as the evaluation point leaves its
+      horizontal extent (|x_local| > r), so larger values degrade gracefully.
+    */
+    int    neighbors;       /* circles per side (>=1); 1 == classic */
 } sw_params_t;
 
 /* Returns sensible defaults. */
